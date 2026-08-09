@@ -7,10 +7,12 @@
 #   menace100/php-apache-hardened:8.4
 #   menace100/php-apache-hardened:8.5
 #   menace100/php-apache-hardened:stable   -> whichever STABLE_MAJOR names
+#   menace100/php-apache-hardened:latest   -> whichever LATEST_MAJOR names
 #
-# There is deliberately no :latest tag. Pulling with no tag fails rather
-# than silently handing someone a PHP major their application may not
-# support - the version is always an explicit choice.
+# :latest follows the newest PHP major Alpine packages, so pulling with no tag
+# hands you the newest PHP - which an older application may not support, and
+# which moves on its own when Alpine adds a major. Pin a version tag in
+# anything that matters; :latest is a convenience, not a contract.
 #
 # The version list is discovered from the Alpine repositories rather than
 # hardcoded, so a new major appears as a tag on the next run without editing
@@ -45,6 +47,12 @@ REPO="${REPO:-menace100/php-apache-hardened}"
 STABLE_MAJOR="${STABLE_MAJOR:-}"
 STABLE_MAJOR="${STABLE_MAJOR//./}"   # accept 8.4 or 84
 
+# Which major :latest points at. Empty means "the highest major Alpine ships",
+# resolved at run time, so a newly packaged major becomes :latest on the next
+# run without editing anything. Set it to pin a specific major instead.
+LATEST_MAJOR="${LATEST_MAJOR:-}"
+LATEST_MAJOR="${LATEST_MAJOR//./}"
+
 # Build for the architecture the servers run, not the machine building.
 PLATFORM="${PLATFORM:-linux/amd64}"
 
@@ -66,7 +74,7 @@ while [[ $# -gt 0 ]]; do
         --force)   FORCE=1; shift ;;
         --check)   CHECK_ONLY=1; shift ;;
         --php)     ONLY_PHP="${2:-}"; shift 2 ;;
-        -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+        -h|--help) awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "$0"; exit 0 ;;
         *) die "unknown argument: $1" ;;
     esac
 done
@@ -192,13 +200,21 @@ ALL_MAJORS="$(discover_majors)"
 [[ -n "$ALL_MAJORS" ]] || die "no phpNN-apache2 packages found in ${BASE}"
 log "alpine ships: $(tr '\n' ' ' <<<"$ALL_MAJORS")"
 
-# Resolved from the full list, never from a --php subset: building only 85
-# must not promote 85 to :stable.
+# Both resolved from the full list, never from a --php subset: building only 85
+# must not promote 85 to :stable, and building only 83 must not drag :latest
+# back down to 83.
 if [[ -z "$STABLE_MAJOR" ]]; then
     STABLE_MAJOR="$(head -1 <<<"$ALL_MAJORS")"
     log ":stable resolves to $(dotted "$STABLE_MAJOR") (lowest major available)"
 else
     log ":stable pinned to $(dotted "$STABLE_MAJOR")"
+fi
+
+if [[ -z "$LATEST_MAJOR" ]]; then
+    LATEST_MAJOR="$(tail -1 <<<"$ALL_MAJORS")"
+    log ":latest resolves to $(dotted "$LATEST_MAJOR") (highest major available)"
+else
+    log ":latest pinned to $(dotted "$LATEST_MAJOR")"
 fi
 
 if [[ -n "$ONLY_PHP" ]]; then
@@ -245,6 +261,9 @@ log "will build: $(tr '\n' ' ' <<<"$MAJORS")"
 if ! grep -qx "$STABLE_MAJOR" <<<"$MAJORS"; then
     log "WARNING: STABLE_MAJOR=${STABLE_MAJOR} is not in the build list; :stable will not be updated"
 fi
+if ! grep -qx "$LATEST_MAJOR" <<<"$MAJORS"; then
+    log "WARNING: LATEST_MAJOR=${LATEST_MAJOR} is not in the build list; :latest will not be updated"
+fi
 
 BUILT=(); FAILED=()
 
@@ -282,12 +301,24 @@ done
 
 [[ ${#BUILT[@]} -gt 0 ]] || die "nothing built successfully, nothing to push"
 
-if grep -qx "$STABLE_MAJOR" <<<"$(printf '%s\n' "${BUILT[@]}")"; then
-    docker tag "${REPO}:$(dotted "$STABLE_MAJOR")" "${REPO}:stable"
-    log "tagged :stable from $(dotted "$STABLE_MAJOR")"
-else
-    log "WARNING: ${STABLE_MAJOR} did not build; leaving :stable untouched"
-fi
+# Move an alias tag onto a major that built this run. An alias is only ever
+# repointed at an image that passed its smoke test; if that major did not build,
+# whatever is published keeps the alias rather than it being dropped or moved
+# onto some other major.
+promote() {
+    local alias="$1" major="$2"
+    if grep -qx "$major" <<<"$(printf '%s\n' "${BUILT[@]}")"; then
+        docker tag "${REPO}:$(dotted "$major")" "${REPO}:${alias}"
+        log "tagged :${alias} from $(dotted "$major")"
+        return 0
+    fi
+    log "WARNING: ${major} did not build; leaving :${alias} untouched"
+    return 1
+}
+
+ALIASES=()
+promote stable "$STABLE_MAJOR" && ALIASES+=(stable)
+promote latest "$LATEST_MAJOR" && ALIASES+=(latest)
 
 if (( NO_PUSH )); then
     log "--no-push: built and tested ${BUILT[*]}, nothing pushed"
@@ -296,10 +327,10 @@ else
         log "pushing ${REPO}:$(dotted "$major")"
         docker push -q "${REPO}:$(dotted "$major")" >/dev/null || die "push failed (docker login?)"
     done
-    if grep -qx "$STABLE_MAJOR" <<<"$(printf '%s\n' "${BUILT[@]}")"; then
-        log "pushing ${REPO}:stable"
-        docker push -q "${REPO}:stable" >/dev/null || die "push of :stable failed"
-    fi
+    for alias in ${ALIASES[@]+"${ALIASES[@]}"}; do
+        log "pushing ${REPO}:${alias}"
+        docker push -q "${REPO}:${alias}" >/dev/null || die "push of :${alias} failed"
+    done
 fi
 
 log "built: ${BUILT[*]}"

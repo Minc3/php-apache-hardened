@@ -27,24 +27,25 @@ docker run -d \
 |---|---|---|
 | `8.3`, `stable` | 8.3 | Oldest major Alpine still packages, so the widest application compatibility. |
 | `8.4` | 8.4 | |
-| `8.5` | 8.5 | Newest; expect deprecation fatals in older code. |
+| `8.5`, `latest` | 8.5 | Newest; expect deprecation fatals in older code. |
 
 Every tag is the same image and the same hardening — only the PHP major
 differs. Apache, the extension set and every environment variable behave
 identically across all of them.
 
-**There is no `:latest` tag.** Pulling with no tag fails rather than silently
-handing you a PHP major your application may not support — the version is always
-an explicit choice.
+**`:latest` follows the highest PHP major Alpine ships** — today 8.5. Like
+`:stable` it is resolved at build time, not hardcoded, so the day Alpine
+packages a new major, `:latest` becomes that major. Pulling with no tag
+therefore gives you the newest PHP, which an off-the-shelf application may not
+support — see [Which one](#which-one) below.
 
-**`:stable` follows the lowest PHP major Alpine ships** — today 8.3. It is
-resolved at build time, not hardcoded, so when Alpine drops a major `:stable`
-moves up to the next oldest on its own. That means it can change PHP version
-under you.
+**`:stable` follows the lowest PHP major Alpine ships** — today 8.3. When Alpine
+drops a major, `:stable` moves up to the next oldest on its own.
 
-**Pin a major.** `:stable` moves when the lowest available major changes; `:8.3` stays on
+**Pin a major.** Both aliases change PHP version under you; `:8.3` stays on
 8.3 but still picks up Alpine, Apache and PHP patch updates on each rebuild. To
-pin an exact build, reference it by digest (`@sha256:…`).
+pin an exact build, reference it by digest (`@sha256:…`). Use a version tag for
+anything you care about and treat `:latest` as a convenience.
 
 ### Which one
 
