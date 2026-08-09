@@ -325,6 +325,41 @@ outbound calls.
 
 ---
 
+## Building and updates
+
+Images are built from one Dockerfile by `build-all.sh`, which discovers the PHP
+majors Alpine ships rather than hardcoding them — a new major becomes a tag on
+the next run with no edit.
+
+```bash
+./build-all.sh              # rebuild + push only what is stale
+./build-all.sh --check      # report only (exit 10 = work to do)
+./build-all.sh --force      # rebuild every major regardless
+./build-all.sh --no-push    # build and smoke test only
+./build-all.sh --php 8.4    # restrict to one major
+./build-all.sh --list       # show what would be built
+```
+
+Nothing inside a container auto-updates: packages are frozen at build time. The
+script asks each **published** tag what it would upgrade, and rebuilds only the
+majors where something actually moved — a new Alpine package, or a new base
+image digest recorded as a `base.digest` label at build time. A run with nothing
+to do takes a few seconds and pushes nothing, so it is safe to run daily:
+
+```
+20 4 * * * /path/to/build-all.sh >> /var/log/php-apache-hardened.log 2>&1
+```
+
+Cron needs `docker login` as the user it runs as, and a `PATH` that includes
+`docker`. Each major is built and tested independently — one broken version is
+skipped and reported rather than blocking the rest, and a version that fails its
+smoke test is never tagged or pushed.
+
+Editing the Dockerfile does **not** trigger a rebuild; the check only looks at
+package versions. Use `--force`.
+
+---
+
 ## Notes
 
 - Apache runs `mpm_prefork` with mod_php.

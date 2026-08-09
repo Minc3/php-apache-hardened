@@ -16,12 +16,21 @@
 # hardcoded, so a new major appears as a tag on the next run without editing
 # anything, and one that is dropped stops being built.
 #
-#   ./build-all.sh                 build every discovered major, test, push
+# By default only majors that actually have something new are rebuilt, so this
+# is safe to run daily from cron: a run with nothing to do costs a few seconds
+# and pushes nothing.
+#
+#   ./build-all.sh                 rebuild + push only what is stale
+#   ./build-all.sh --force         rebuild every major regardless
+#   ./build-all.sh --check         report only, never build (exit 10 = work to do)
 #   ./build-all.sh --no-push       build and test only
 #   ./build-all.sh --php 8.4,8.5   restrict to specific majors (84,85 also accepted)
 #   ./build-all.sh --list          show what would be built, then exit
 #
 # Requires a prior `docker login`.
+#
+# Cron (daily 04:20):
+#   20 4 * * * /path/to/build-all.sh >> /var/log/php-apache-hardened.log 2>&1
 
 set -euo pipefail
 
@@ -49,11 +58,13 @@ dotted() { local v="$1"; printf '%s.%s' "${v%?}" "${v##*"${v%?}"}"; }
 log()  { printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
 die()  { log "ERROR: $*"; exit 1; }
 
-NO_PUSH=0; LIST_ONLY=0; ONLY_PHP=""
+NO_PUSH=0; LIST_ONLY=0; FORCE=0; CHECK_ONLY=0; ONLY_PHP=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --no-push) NO_PUSH=1; shift ;;
         --list)    LIST_ONLY=1; shift ;;
+        --force)   FORCE=1; shift ;;
+        --check)   CHECK_ONLY=1; shift ;;
         --php)     ONLY_PHP="${2:-}"; shift 2 ;;
         -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
         *) die "unknown argument: $1" ;;
@@ -78,6 +89,51 @@ discover_majors() {
     docker run --rm --entrypoint sh "$BASE" -c \
         'apk update >/dev/null 2>&1; apk search -q "php*-apache2" 2>/dev/null' \
         | grep -oE '^php[0-9]+' | sed 's/^php//' | sort -n -u
+}
+
+# ----------------------------------------------------- update detection -----
+# Current digest of the base image, resolved from the registry. Stamped onto
+# every build as a label, so staleness is a fact about the published image
+# rather than about this machine's pull history.
+BASE_DIGEST=""
+base_digest() {
+    if [[ -z "$BASE_DIGEST" ]]; then
+        docker pull -q "$BASE" >/dev/null 2>&1 || true
+        BASE_DIGEST="$(docker image inspect "$BASE" --format '{{index .RepoDigests 0}}' 2>/dev/null || echo "")"
+    fi
+    printf '%s' "$BASE_DIGEST"
+}
+
+# Why a published major would need rebuilding. Echoes the reason and returns 0,
+# or returns 1 when it is already current.
+needs_build() {
+    local major="$1" ref out built_from current
+    ref="${REPO}:$(dotted "$major")"
+
+    if ! docker pull -q "$ref" >/dev/null 2>&1; then
+        echo "not published yet"; return 0
+    fi
+
+    # Ask the published image what it would upgrade - exactly the question
+    # "is what I shipped now stale". --simulate changes nothing.
+    out="$(docker run --rm --entrypoint sh "$ref" -c \
+            'apk update >/dev/null 2>&1 && apk upgrade --simulate 2>&1' || true)"
+    # apk prints "(1/10) Upgrading musl (...)", so this must not be anchored.
+    if grep -qE '\bUpgrading ' <<<"$out"; then
+        echo "$(grep -cE '\bUpgrading ' <<<"$out") package update(s)"; return 0
+    fi
+
+    built_from="$(docker image inspect "$ref" \
+        --format '{{index .Config.Labels "base.digest"}}' 2>/dev/null || echo "")"
+    current="$(base_digest)"
+    if [[ -z "$built_from" ]]; then
+        echo "no base.digest label"; return 0
+    fi
+    if [[ -n "$current" && "$built_from" != "$current" ]]; then
+        echo "base image moved"; return 0
+    fi
+
+    return 1
 }
 
 # ---------------------------------------------------------- smoke tests -----
@@ -153,8 +209,38 @@ else
     MAJORS="$ALL_MAJORS"
 fi
 
-log "will build: $(tr '\n' ' ' <<<"$MAJORS")"
+log "candidates: $(tr '\n' ' ' <<<"$MAJORS")"
 (( LIST_ONLY )) && exit 0
+
+# Filter down to what actually has something new, unless forced.
+if (( FORCE )); then
+    log "--force: rebuilding every candidate"
+    TODO="$MAJORS"
+else
+    TODO=""
+    for major in $MAJORS; do
+        if reason="$(needs_build "$major")"; then
+            log "  php${major}: ${reason}"
+            TODO+="${major}"$'\n'
+        else
+            log "  php${major}: up to date"
+        fi
+    done
+    TODO="$(sed '/^$/d' <<<"$TODO")"
+fi
+
+if [[ -z "$TODO" ]]; then
+    log "nothing to do"
+    exit 0
+fi
+
+if (( CHECK_ONLY )); then
+    log "would rebuild: $(tr '\n' ' ' <<<"$TODO") (check only)"
+    exit 10
+fi
+
+MAJORS="$TODO"
+log "will build: $(tr '\n' ' ' <<<"$MAJORS")"
 
 if ! grep -qx "$STABLE_MAJOR" <<<"$MAJORS"; then
     log "WARNING: STABLE_MAJOR=${STABLE_MAJOR} is not in the build list; :stable will not be updated"
@@ -168,10 +254,12 @@ for major in $MAJORS; do
 
     if docker buildx version >/dev/null 2>&1; then
         build_ok=$(docker buildx build --platform "$PLATFORM" --pull \
-            --build-arg "PHP_VER=${major}" --load -t "$local_tag" . >/dev/null 2>&1 && echo yes || echo no)
+            --build-arg "PHP_VER=${major}" --label "base.digest=$(base_digest)" \
+            --load -t "$local_tag" . >/dev/null 2>&1 && echo yes || echo no)
     else
         build_ok=$(docker build --pull \
-            --build-arg "PHP_VER=${major}" -t "$local_tag" . >/dev/null 2>&1 && echo yes || echo no)
+            --build-arg "PHP_VER=${major}" --label "base.digest=$(base_digest)" \
+            -t "$local_tag" . >/dev/null 2>&1 && echo yes || echo no)
     fi
 
     if [[ "$build_ok" != yes ]]; then
