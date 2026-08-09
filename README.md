@@ -19,7 +19,7 @@ docker run -d \
   --user 33:33 \
   --sysctl net.ipv4.ip_unprivileged_port_start=0 \
   -e TZ=Europe/London \
-  menace100/php-apache-hardened:8.3
+  menace100/php-apache-hardened:stable
 ```
 
 ---
