@@ -157,7 +157,7 @@ and cannot be relaxed.
 ```yaml
 services:
   web:
-    image: menace100/php-apache-hardened:8.3
+    image: menace100/php-apache-hardened:stable
     restart: unless-stopped
     environment:
       - TZ=Europe/London
