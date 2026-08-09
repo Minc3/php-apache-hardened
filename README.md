@@ -2,6 +2,9 @@
 
 **Alpine 3.24 · Apache 2.4 · PHP 8.3, 8.4 or 8.5 · 110–125 MB**
 
+Source: [github.com/Minc3/php-apache-hardened](https://github.com/Minc3/php-apache-hardened) ·
+Images: [hub.docker.com/r/menace100/php-apache-hardened](https://hub.docker.com/r/menace100/php-apache-hardened)
+
 A hardened Apache + PHP image for running PHP applications behind a reverse
 proxy. Runs as a non-root user (UID 33) on a read-only filesystem, with the
 command-execution functions disabled and the filesystem confined.
@@ -179,6 +182,15 @@ services:
     tmpfs:
       - /run/apache2:uid=33,gid=33,mode=0755,noexec,nosuid,nodev
       - /tmp:uid=33,gid=33,mode=1777,noexec,nosuid,nodev
+
+    # Apache logs to stdout, so every access line becomes a host json-file
+    # entry. Uncapped that grows until the disk is full. 30M holds enough
+    # history to debug a recent incident.
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '3'
 ```
 
 ### UID 33
