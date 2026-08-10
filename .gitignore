@@ -1,0 +1,5 @@
+# Scratch directories the test suite and the build script create beside
+# themselves, both named after the running PID and removed on exit. They only
+# survive a crash or a --keep run, and must never be committed.
+.probe.*
+.smoke.*

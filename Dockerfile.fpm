@@ -1,0 +1,746 @@
+FROM alpine:3.24
+
+# The php-fpm variant of php-apache-hardened. Same hardening, same mount
+# layout, same PHP majors as the mod_php image in ./Dockerfile - what changes
+# is how PHP is executed:
+#
+#   Dockerfile      mpm_prefork + mod_php    one interpreter per connection
+#   Dockerfile.fpm  mpm_event  + php-fpm     interpreters only while PHP runs
+#
+# mod_php requires prefork, and prefork gives every connection - a static
+# image, an idle keepalive socket, a slow client - a child carrying a full
+# PHP interpreter. That, not PHP itself, is what the split fixes: connections
+# are held by event threads (a few M each) while PHP concurrency is capped
+# separately by the FPM pool. PHP does NOT execute faster here; the same
+# opcode runs under the same OPcache. What changes is that concurrency and
+# memory stop being the same number.
+#
+# Read ./Dockerfile for the reasoning behind anything not specific to FPM -
+# the UID 33 choice, the ServerRoot move, mod_remoteip, the deny rules and
+# the PHP hardening ini are all carried over unchanged.
+ARG PHP_VER=83
+
+# 1. Apache, PHP-FPM, mod_proxy_fcgi, MySQL drivers, and the extension set
+# that off-the-shelf PHP applications (forums, stores, CMSes) expect.
+# phpNN-apache2 (mod_php) is deliberately absent and phpNN-fpm replaces it;
+# apache2-proxy supplies mod_proxy and mod_proxy_fcgi. The finished image runs
+# about 4M larger than the mod_php one (113M against 109M on 8.3) - FPM is a
+# second full SAPI binary, and apache2-proxy is not split per module. Disk is
+# not what this variant saves; resident memory under load is.
+# Deliberately NOT installed: phar (deserialization vector), posix/pcntl
+# (process control), ftp, sockets, soap. Add only if an app actually needs one.
+# apk upgrade first: `apk add` only installs what is named, it never
+# upgrades what the base image already ships (apk-tools, musl, busybox,
+# openssl). Without this those stay pinned to the base image forever, so
+# the daily update check would report the same upgrades on every run and
+# rebuild endlessly, while the packages themselves never actually moved.
+RUN apk upgrade --no-cache && apk add --no-cache \
+    apache2 \
+    apache2-proxy \
+    php${PHP_VER} \
+    php${PHP_VER}-fpm \
+    php${PHP_VER}-pdo \
+    php${PHP_VER}-pdo_mysql \
+    php${PHP_VER}-mysqli \
+    php${PHP_VER}-session \
+    php${PHP_VER}-mbstring \
+    php${PHP_VER}-iconv \
+    php${PHP_VER}-ctype \
+    php${PHP_VER}-tokenizer \
+    php${PHP_VER}-fileinfo \
+    php${PHP_VER}-gd \
+    php${PHP_VER}-exif \
+    php${PHP_VER}-curl \
+    php${PHP_VER}-dom \
+    php${PHP_VER}-xml \
+    php${PHP_VER}-simplexml \
+    php${PHP_VER}-xmlreader \
+    php${PHP_VER}-xmlwriter \
+    php${PHP_VER}-intl \
+    php${PHP_VER}-zip \
+    php${PHP_VER}-bcmath \
+    php${PHP_VER}-sodium \
+    php${PHP_VER}-openssl \
+    curl \
+    tzdata
+
+# 1a. OPcache, which is the one package that is not uniform across majors:
+# 83 and 84 ship it separately, 85 compiles it into the core php85 package and
+# publishes no php85-opcache at all. Naming it unconditionally above aborts a
+# PHP_VER=85 build with "unable to select packages", so it is conditional here.
+# Either way `php -m` reports "Zend OPcache" and the opcache.* ini keys in 4f
+# apply - verify with: docker run --rm <img> php -m | grep -i opcache
+RUN if apk add --no-cache --simulate php${PHP_VER}-opcache >/dev/null 2>&1; then \
+        apk add --no-cache php${PHP_VER}-opcache; \
+    else \
+        php${PHP_VER} -m | grep -qi 'Zend OPcache' \
+            || { echo "no opcache for php${PHP_VER}: no package and not built in"; exit 1; }; \
+    fi
+
+# 1b. Alpine 3.24 defaults to php85, so a non-default major installs only
+# /usr/bin/phpXX and /usr/sbin/php-fpmXX. Provide the conventional names so
+# tooling, CLI scripts and the entrypoint below are version-agnostic.
+RUN ln -sf /usr/bin/php${PHP_VER} /usr/bin/php && \
+    ln -sf /usr/sbin/php-fpm${PHP_VER} /usr/sbin/php-fpm
+
+# 2. Redirect Apache logs to stdout/stderr for Docker logging.
+# FPM gets no file at all - it is started with an error_log of /proc/self/fd/2
+# in 4g, so its master log and (through catch_workers_output) every PHP warning
+# land on the container's stderr directly.
+RUN ln -sf /dev/stdout /var/log/apache2/access.log && \
+    ln -sf /dev/stderr /var/log/apache2/error.log
+
+# 3. Create the non-root www-data user at UID/GID 33.
+# Alpine's own www-data is 82, but bind mounts carry raw numeric IDs and the
+# Debian/Ubuntu hosts this runs on use 33 - so 82 would read as a foreign user
+# and Apache would get EACCES on the mounted site. The stock group is dropped
+# and recreated because it is fixed at GID 82.
+RUN deluser www-data 2>/dev/null || true; \
+    delgroup www-data 2>/dev/null || true; \
+    addgroup -g 33 www-data && \
+    adduser -u 33 -D -S -G www-data www-data
+
+# 4. Configure Apache for running as non-root and secure header tokens.
+# ServerRoot is moved off /var/www first: Alpine points it at /var/www, which
+# holds the modules/logs/run symlinks, so bind-mounting a project over
+# /var/www would mask them and Apache would fail to load a single module.
+RUN sed -i 's|^ServerRoot /var/www|ServerRoot /etc/apache2|' /etc/apache2/httpd.conf && \
+    ln -sf /usr/lib/apache2 /etc/apache2/modules && \
+    ln -sf /var/log/apache2 /etc/apache2/logs && \
+    ln -sf /run/apache2 /etc/apache2/run && \
+    sed -i 's|/var/www/localhost/htdocs|/var/www/html|g' /etc/apache2/httpd.conf && \
+    sed -i 's|LogFormat "%h |LogFormat "%a |g' /etc/apache2/httpd.conf && \
+    sed -i 's|^\( *\)CustomLog \(.*\) combined$|\1CustomLog \2 combined env=!healthcheck|' \
+        /etc/apache2/httpd.conf && \
+    sed -i 's/User apache/User www-data/g' /etc/apache2/httpd.conf && \
+    sed -i 's/Group apache/Group www-data/g' /etc/apache2/httpd.conf && \
+    sed -i 's/^Listen .*/Listen 80/' /etc/apache2/httpd.conf && \
+    echo "ServerTokens Prod" >> /etc/apache2/httpd.conf && \
+    echo "ServerSignature Off" >> /etc/apache2/httpd.conf
+
+# 4a. Swap prefork for the event MPM. This is the point of the variant: prefork
+# is only mandatory because mod_php is not thread safe, and with PHP out of the
+# server process that constraint is gone. Event parks idle keepalive
+# connections on a listener thread instead of pinning a whole worker to each.
+RUN sed -i -E 's@^LoadModule mpm_prefork_module@#&@; s@^#(LoadModule mpm_event_module)@\1@' \
+        /etc/apache2/httpd.conf && \
+    grep -q '^LoadModule mpm_event_module' /etc/apache2/httpd.conf \
+        || { echo "event MPM was not enabled"; exit 1; }
+
+# 4b. Drop modules and stock config we do not serve with.
+# languages.conf must go with mod_negotiation: its LanguagePriority /
+# ForceLanguagePriority directives are NOT <IfModule>-guarded and would
+# abort startup once the module is gone.
+# apache2-proxy's conf.d/proxy.conf loads NINETEEN modules - ajp, ftp, connect,
+# wstunnel, the balancer and its four lbmethods - when this image forwards to
+# exactly one FastCGI socket. Everything except mod_proxy itself and
+# mod_proxy_fcgi is commented out; mod_proxy_connect in particular is a
+# forward-proxy CONNECT handler and has no business in this image.
+RUN rm -f /etc/apache2/conf.d/info.conf \
+          /etc/apache2/conf.d/userdir.conf \
+          /etc/apache2/conf.d/languages.conf && \
+    sed -i -E 's@^(LoadModule (autoindex|status|negotiation|userdir|info|cgid?)_module)@#\1@' \
+        /etc/apache2/httpd.conf && \
+    sed -i -E 's@^(LoadModule (slotmem_shm|watchdog|lbmethod_[a-z]+|proxy_(ajp|balancer|connect|express|fdpass|ftp|hcheck|http|scgi|uwsgi|wstunnel))_module)@#\1@' \
+        /etc/apache2/conf.d/proxy.conf && \
+    grep -q '^LoadModule proxy_fcgi_module' /etc/apache2/conf.d/proxy.conf \
+        || { echo "mod_proxy_fcgi was disabled by mistake"; exit 1; }
+
+# 4c. Enable mod_rewrite / .htaccess, point DocumentRoot at the mounted source,
+# and apply response-header + exposure hardening.
+# conf.d is included at the end of httpd.conf, so this overrides the defaults.
+RUN printf '%s\n' \
+    'ServerName ${APACHE_SERVER_NAME}' \
+    '' \
+    '# mod_rewrite, so RewriteEngine directives in .htaccess are understood' \
+    'LoadModule rewrite_module modules/mod_rewrite.so' \
+    '' \
+    '# Behind Traefik: take the client IP from X-Forwarded-For so REMOTE_ADDR,' \
+    '# access logs and any app-side rate limiting see the real visitor.' \
+    'LoadModule remoteip_module modules/mod_remoteip.so' \
+    '# CF-Connecting-IP, not X-Forwarded-For. Traefik only preserves an inbound' \
+    '# X-Forwarded-For from peers in its forwardedHeaders.trustedIPs list, and' \
+    '# Cloudflare is not in that list by default - so it discards the header' \
+    '# Cloudflare sent and rewrites it to the Cloudflare edge address, which is' \
+    '# why every visitor logged as a Cloudflare IP. CF-Connecting-IP carries the' \
+    '# real client, is set by Cloudflare, and Traefik forwards it untouched.' \
+    '# Alternative fix, if you prefer standard headers: add the Cloudflare ranges' \
+    '# to forwardedHeaders.trustedIPs on the Traefik entrypoint and set this back' \
+    '# to X-Forwarded-For.' \
+    '# Header carrying the real client, switchable per deployment via the' \
+    '# REMOTE_IP_HEADER env var (defaults to CF-Connecting-IP below). There is' \
+    '# no way to make mod_remoteip try a second header: it accepts exactly one,' \
+    '# and mod_headers cannot feed it because mod_remoteip always runs first in' \
+    '# post_read_request regardless of module load order (both tested).' \
+    'RemoteIPHeader ${REMOTE_IP_HEADER}' \
+    '# Only these sources may assert an X-Forwarded-For. mod_remoteip walks the' \
+    '# header right to left and stops at the first untrusted hop, so every hop' \
+    '# in client -> Cloudflare -> Traefik -> Apache must be listed or the' \
+    '# client IP resolves to Cloudflare instead of the real visitor. Trusting' \
+    '# anything beyond these lets a client spoof its IP and evade bans.' \
+    '' \
+    '# Traefik, on the docker network' \
+    'RemoteIPInternalProxy 10.0.0.0/8' \
+    'RemoteIPInternalProxy 172.16.0.0/12' \
+    'RemoteIPInternalProxy 192.168.0.0/16' \
+    'RemoteIPInternalProxy 127.0.0.0/8' \
+    '' \
+    '# Cloudflare edge. Current as of the image build; refresh from' \
+    '# https://www.cloudflare.com/ips-v4 and https://www.cloudflare.com/ips-v6' \
+    'RemoteIPInternalProxy 173.245.48.0/20' \
+    'RemoteIPInternalProxy 103.21.244.0/22' \
+    'RemoteIPInternalProxy 103.22.200.0/22' \
+    'RemoteIPInternalProxy 103.31.4.0/22' \
+    'RemoteIPInternalProxy 141.101.64.0/18' \
+    'RemoteIPInternalProxy 108.162.192.0/18' \
+    'RemoteIPInternalProxy 190.93.240.0/20' \
+    'RemoteIPInternalProxy 188.114.96.0/20' \
+    'RemoteIPInternalProxy 197.234.240.0/22' \
+    'RemoteIPInternalProxy 198.41.128.0/17' \
+    'RemoteIPInternalProxy 162.158.0.0/15' \
+    'RemoteIPInternalProxy 104.16.0.0/13' \
+    'RemoteIPInternalProxy 104.24.0.0/14' \
+    'RemoteIPInternalProxy 172.64.0.0/13' \
+    'RemoteIPInternalProxy 131.0.72.0/22' \
+    'RemoteIPInternalProxy 2400:cb00::/32' \
+    'RemoteIPInternalProxy 2606:4700::/32' \
+    'RemoteIPInternalProxy 2803:f800::/32' \
+    'RemoteIPInternalProxy 2405:b500::/32' \
+    'RemoteIPInternalProxy 2405:8100::/32' \
+    'RemoteIPInternalProxy 2a06:98c0::/29' \
+    'RemoteIPInternalProxy 2c0f:f248::/32' \
+    '' \
+    '# Traefik terminates TLS, so tell PHP the original scheme was https.' \
+    '# Without this apps build http:// URLs and redirect loop behind the proxy.' \
+    '<IfModule setenvif_module>' \
+    '    SetEnvIf X-Forwarded-Proto "^https$" HTTPS=on' \
+    '' \
+    '    # Keep the 30s container healthcheck out of the access log. Both must' \
+    '    # hold: the loopback origin AND the user-agent, so neither alone can' \
+    '    # hide a request. CONN_REMOTE_ADDR is the raw peer address - unlike' \
+    '    # REMOTE_ADDR it is NOT rewritten by mod_remoteip, so a forged' \
+    '    # X-Forwarded-For cannot make an outside request look like loopback.' \
+    '    # Errors it triggers still reach the error log.' \
+    '    SetEnvIfExpr "%{CONN_REMOTE_ADDR} -eq '"'"'127.0.0.1'"'"' && %{HTTP_USER_AGENT} == '"'"'docker-healthcheck'"'"'" healthcheck' \
+    '</IfModule>' \
+    '' \
+    '# No TRACE (cross-site tracing) and no inode/size ETags (info leak)' \
+    'TraceEnable Off' \
+    'FileETag None' \
+    '' \
+    '# Cap request body size at 33M, just above PHP post_max_size (32M)' \
+    'LimitRequestBody ${APACHE_LIMIT_REQUEST_BODY}' \
+    '' \
+    '# The stock DocumentRoot is /var/www/localhost/htdocs, but the application' \
+    '# source is mounted at /var/www/html (see docker-compose.yml).' \
+    'DocumentRoot "/var/www/html"' \
+    '' \
+    '<Directory "/var/www/html">' \
+    '    # FollowSymLinks is required for RewriteRule to work inside .htaccess.' \
+    '    # Indexes is deliberately omitted: no directory listings.' \
+    '    Options FollowSymLinks' \
+    '' \
+    '    # Let .htaccess files take effect (rewrites, auth, headers, ...)' \
+    '    AllowOverride All' \
+    '' \
+    '    Require all granted' \
+    '</Directory>' \
+    '' \
+    '# Dotfiles and dot-directories (.git, .env, .svn), but not /.well-known/*' \
+    '<FilesMatch "^\.">' \
+    '    Require all denied' \
+    '</FilesMatch>' \
+    '<DirectoryMatch "/\.(?!well-known)">' \
+    '    Require all denied' \
+    '</DirectoryMatch>' \
+    '' \
+    '# Files that ship with a repo but must never be served' \
+    '<FilesMatch "(?i)(^(composer|package)(-lock)?\.(json|lock)$|\.(env|ini|log|sh|sql|bak|swp|dist|tpl)$)">' \
+    '    Require all denied' \
+    '</FilesMatch>' \
+    '' \
+    '<IfModule headers_module>' \
+    '    Header always set X-Content-Type-Options "nosniff"' \
+    '    Header always set X-Frame-Options "DENY"' \
+    '    Header always set Referrer-Policy "no-referrer"' \
+    '    Header always set Permissions-Policy "geolocation=(), camera=(), microphone=()"' \
+    '    # No CSP by default: a store needs its payment provider'"'"'s scripts and' \
+    '    # frames, and a wrong policy breaks checkout silently. Set a policy per' \
+    '    # site in its .htaccess, e.g. for a Stripe checkout:' \
+    '    #   Header always set Content-Security-Policy "default-src '"'"'self'"'"'; \' \
+    '    #     script-src '"'"'self'"'"' https://js.stripe.com; frame-src https://js.stripe.com"' \
+    '    # Belt and braces alongside expose_php=Off' \
+    '    Header always unset X-Powered-By' \
+    '    # Add HSTS only once this is served over TLS:' \
+    '    # Header always set Strict-Transport-Security "max-age=31536000; includeSubDomains"' \
+    '</IfModule>' \
+    > /etc/apache2/conf.d/custom.conf
+
+# 4d. Hand .php to FPM over a unix socket.
+# Named zz- so it sorts after proxy.conf in conf.d and therefore parses with
+# mod_proxy already loaded; custom.conf would not, it sorts before it.
+#
+# The <If> guard is the security-relevant part. A bare SetHandler forwards
+# ANYTHING whose path contains .php to FPM whether or not the file exists, so
+# /uploads/avatar.jpg/x.php reaches the interpreter and PATH_INFO decides what
+# actually runs. Requiring the resolved filename to be a real file collapses
+# that: /index.php/nonexistent.php and /nope.php both return 404 without the
+# socket being touched. cgi.fix_pathinfo=0 and FPM's security.limit_extensions
+# are the second and third layers.
+#
+# PATH_INFO routing (/index.php/controller/action) therefore does not work, and
+# there is deliberately no switch for it - dropping the guard does NOT bring it
+# back. Tested both ways: Apache hands FPM a SCRIPT_FILENAME of
+# /var/www/html/controller/action either way, which security.limit_extensions
+# then refuses, so the guardless config buys a 403 instead of a 404 and nothing
+# else. Making it genuinely work needs ProxyFCGISetEnvIf rewriting of
+# SCRIPT_FILENAME/PATH_INFO, which is exactly the fragile machinery that this
+# class of bug lives in. Front-controller rewrites - WordPress, IPS, Laravel,
+# Magento - are unaffected, because mod_rewrite resolves those to a real file
+# before the handler is chosen.
+RUN printf '%s\n' \
+    '# Alpine ships index.php in DirectoryIndex from php-module.conf, which is' \
+    '# part of the mod_php package this image does not install. Without this a' \
+    '# bare / on a PHP application returns 403.' \
+    'DirectoryIndex index.php index.html' \
+    '' \
+    '<FilesMatch "\.php$">' \
+    '    <If "-f %{REQUEST_FILENAME}">' \
+    '        SetHandler "proxy:unix:/run/php-fpm/www.sock|fcgi://php-fpm"' \
+    '    </If>' \
+    '</FilesMatch>' \
+    '' \
+    '# LimitRequestBody does NOT apply to a FastCGI-handled request. mod_php' \
+    '# reads the body through ap_get_client_block(), which enforces the limit;' \
+    '# mod_proxy_fcgi streams it to the socket itself and never consults it. So' \
+    '# the LimitRequestBody in custom.conf still protects static files here, but' \
+    '# a PHP upload would be capped only by post_max_size - Apache would accept' \
+    '# and forward the whole body first. Tested: 2000 bytes against a 1000 byte' \
+    '# limit is 413 on the mod_php image and 200 here without this block.' \
+    '#' \
+    '# Declared length is checked instead. A chunked body carries no' \
+    '# Content-Length and still slips through to post_max_size - mod_php catches' \
+    '# that case and this does not, which is the one hardening difference' \
+    '# between the two images. There is no config-level fix: the limit has to be' \
+    '# enforced by whatever reads the body, and that is the proxy module.' \
+    '<If "-n %{req:Content-Length} && %{req:Content-Length} -gt ${APACHE_LIMIT_REQUEST_BODY}">' \
+    '    Redirect 413' \
+    '</If>' \
+    '' \
+    '# Apache must outwait PHP, or a long request is cut off at the proxy with a' \
+    '# 504 while FPM is still working on it - which logs as a backend failure and' \
+    '# tells you nothing about the real cause. The ladder is max_execution_time' \
+    '# (60) < request_terminate_timeout (75) < ProxyTimeout (90): PHP gives up' \
+    '# first, FPM kills a worker that ignored that, Apache gives up last.' \
+    'ProxyTimeout ${APACHE_PROXY_TIMEOUT}' \
+    '' \
+    '# Forward proxying stays off. It is the default, but this image loads' \
+    '# mod_proxy and an open forward proxy is the one way that module turns into' \
+    '# a liability, so it is stated rather than assumed.' \
+    'ProxyRequests Off' \
+    '' \
+    '# FPM ping, for the container healthcheck. This exists so the probe can' \
+    '# prove Apache is serving AND the FastCGI socket answers WITHOUT running' \
+    '# the application - the mod_php image probes / every 30s, which executes' \
+    '# the full stack including its database calls, ~2,880 times a day.' \
+    '#' \
+    '# Aliased outside the docroot on purpose: a front-controller .htaccess' \
+    '# rewrites every non-existent path to index.php, and /fpm-ping is exactly' \
+    '# such a path. Mapping it to /var/lib/fpm/ping.php puts it in a directory' \
+    '# with no .htaccess, so no application rewrite can capture it. It keeps a' \
+    '# .php suffix so security.limit_extensions still accepts it; FPM answers' \
+    '# ping.path before it ever looks at the file, and open_basedir would deny' \
+    '# reading it anyway if that ordering ever changed.' \
+    'Alias /fpm-ping /var/lib/fpm/ping.php' \
+    '<Location "/fpm-ping">' \
+    '    # CONN_REMOTE_ADDR, not REMOTE_ADDR: Traefik is a trusted proxy, so a' \
+    '    # request arriving through it carrying CF-Connecting-IP: 127.0.0.1' \
+    '    # would otherwise present as loopback and expose this externally.' \
+    '    Require expr "%{CONN_REMOTE_ADDR} -eq '"'"'127.0.0.1'"'"'"' \
+    '    SetHandler "proxy:unix:/run/php-fpm/www.sock|fcgi://php-fpm"' \
+    '</Location>' \
+    > /etc/apache2/conf.d/zz-fpm.conf && \
+    mkdir -p /var/lib/fpm && \
+    printf '%s\n' '<?php http_response_code(503);' > /var/lib/fpm/ping.php
+
+# 4e. Size the event MPM to the container.
+# This is where the variant pays off. Under prefork + mod_php the worker count
+# was a memory budget - 24 children at 60-90M resident was the 2G wall - and it
+# doubled as the connection limit, so 24 idle keepalive sockets could starve
+# the site. Here they are separate numbers: Apache threads only shuffle bytes,
+# and PHP concurrency is PHP_FPM_MAX_CHILDREN in 4g. 256 concurrent connections
+# against 24 PHP workers is the intended shape.
+#
+# ServerLimit and ThreadLimit are not meant to be set by hand: event requires
+# ServerLimit >= MaxRequestWorkers / ThreadsPerChild and silently clamps
+# otherwise, and Apache config cannot do arithmetic. The entrypoint computes
+# both from the two variables an operator actually reasons about and exports
+# them over whatever the environment held, so the pair can never disagree.
+# They still carry ENV defaults matching the shipped sizing purely so that
+# `docker run --entrypoint httpd <img> -t` validates cleanly - otherwise the
+# unexpanded ${} reads as 1 and buries the real output under clamp warnings.
+# Named zz- so it sorts after mpm.conf in conf.d and therefore wins.
+RUN printf '%s\n' \
+    '<IfModule mpm_event_module>' \
+    '    StartServers            ${APACHE_START_SERVERS}' \
+    '    ThreadsPerChild         ${APACHE_THREADS_PER_CHILD}' \
+    '    ThreadLimit             ${APACHE_THREAD_LIMIT}' \
+    '    ServerLimit             ${APACHE_SERVER_LIMIT}' \
+    '    MaxRequestWorkers       ${APACHE_MAX_REQUEST_WORKERS}' \
+    '    MinSpareThreads         ${APACHE_MIN_SPARE_THREADS}' \
+    '    MaxSpareThreads         ${APACHE_MAX_SPARE_THREADS}' \
+    '    # 0, unlike the mod_php image. There, recycling children was how a' \
+    '    # leaking extension was contained; here Apache holds no interpreter at' \
+    '    # all, and PHP_FPM_MAX_REQUESTS recycles the processes that actually' \
+    '    # run application code.' \
+    '    MaxConnectionsPerChild  ${APACHE_MAX_CONNECTIONS_PER_CHILD}' \
+    '</IfModule>' \
+    > /etc/apache2/conf.d/zz-mpm.conf
+
+# 4f. PHP hardening, identical to the mod_php image apart from cgi.fix_pathinfo,
+# which only exists in a FastCGI SAPI. php.ini DOES perform ${} substitution
+# under FPM, so this stays one file driven by the same environment variables.
+RUN printf '%s\n' \
+    '; Do not advertise PHP (removes the X-Powered-By header)' \
+    'expose_php = Off' \
+    '' \
+    '; Log errors, never render them to the client' \
+    'display_errors = ${PHP_DISPLAY_ERRORS}' \
+    'display_startup_errors = Off' \
+    'log_errors = On' \
+    '; Keep argument values out of stack traces (they leak credentials)' \
+    'zend.exception_ignore_args = On' \
+    '' \
+    '; No remote code through the filesystem API. allow_url_include stays Off' \
+    '; unconditionally - it turns any tainted include path into remote code' \
+    '; execution and no application legitimately needs it.' \
+    'allow_url_include = Off' \
+    '' \
+    '; Values MUST be 0 or 1, never Off/On. With ${} substitution PHP stores the' \
+    '; literal string, so ini_get() returns "Off" - which is TRUTHY in PHP - and' \
+    '; any app testing if(ini_get("allow_url_fopen")) takes the wrong branch.' \
+    '; IPS steam auth does exactly that to decide whether to fall back to cURL.' \
+    '; allow_url_fopen is per-deployment: the store requires it, the landing' \
+    '; page and forums do not. Disabled by default; a compose file opts in.' \
+    '; Enabling it permits SSRF through file_get_contents on a tainted URL,' \
+    '; but not code execution, which allow_url_include above still blocks.' \
+    'allow_url_fopen = ${PHP_ALLOW_URL_FOPEN}' \
+    '' \
+    '; No PATH_INFO guessing. With this off PHP will not fall back to running a' \
+    '; script the web server did not name, which is the second layer under the' \
+    '; <If> guard in 4d against /upload.jpg/shell.php style requests. FastCGI' \
+    '; only - there is no equivalent setting under mod_php.' \
+    'cgi.fix_pathinfo = 0' \
+    '' \
+    '; Follow the TZ environment variable set by the deployment' \
+    'date.timezone = ${TZ}' \
+    '' \
+    '; Confine filesystem access to the app and its temp dir. This is /var/www,' \
+    '; not the docroot, so code kept beside html/ (vendor, config, ..) still' \
+    '; loads while the rest of the filesystem stays off limits.' \
+    'open_basedir = ${PHP_OPEN_BASEDIR}' \
+    '' \
+    '; Command execution, dynamic extension loading and source disclosure.' \
+    '; putenv/symlink/link/php_uname are deliberately left ENABLED: the forum' \
+    '; and store source references all of them, and blocking them causes fatals' \
+    '; rather than protection (php_uname only discloses the OS string).' \
+    '; The exec family is what actually matters here and stays disabled.' \
+    'disable_functions = ${PHP_DISABLE_FUNCTIONS}' \
+    '' \
+    '; Session cookie hardening. INERT until the session extension is present:' \
+    '; Alpine ships it separately, so add php${PHP_VER}-session above if the app uses' \
+    '; sessions (without it session_start() is an undefined function).' \
+    'session.use_strict_mode = 1' \
+    'session.use_only_cookies = 1' \
+    'session.cookie_httponly = 1' \
+    'session.cookie_samesite = "Lax"' \
+    '; Enable once served over TLS:' \
+    '; session.cookie_secure = 1' \
+    '' \
+    '; Resource ceilings. Sized for forum attachments and product images;' \
+    '; must stay under the LimitRequestBody set in custom.conf.' \
+    'memory_limit = ${PHP_MEMORY_LIMIT}' \
+    'max_execution_time = ${PHP_MAX_EXECUTION_TIME}' \
+    'post_max_size = ${PHP_POST_MAX_SIZE}' \
+    'upload_max_filesize = ${PHP_UPLOAD_MAX_FILESIZE}' \
+    'max_file_uploads = ${PHP_MAX_FILE_UPLOADS}' \
+    '; Form fields accepted per request. The 1000 default is exceeded by large' \
+    '; admin forms - IPS permission matrices, store settings pages - and PHP' \
+    '; drops the overflow SILENTLY: no error, no warning, the fields simply' \
+    '; never arrive and the save looks like it worked.' \
+    'max_input_vars = 5000' \
+    '' \
+    '; Opcache. validate_timestamps stays on so a deploy takes effect without' \
+    '; restarting the container; set it to 0 only for immutable image deploys.' \
+    'opcache.enable = ${PHP_OPCACHE_ENABLE}' \
+    'opcache.memory_consumption = ${PHP_OPCACHE_MEMORY}' \
+    'opcache.max_accelerated_files = 20000' \
+    'opcache.validate_timestamps = ${PHP_OPCACHE_VALIDATE_TIMESTAMPS}' \
+    'opcache.revalidate_freq = ${PHP_OPCACHE_REVALIDATE_FREQ}' \
+    > /etc/php${PHP_VER}/conf.d/99_hardening.ini
+
+# 4g. The FPM pool. Alpine's stock www.conf is replaced outright rather than
+# overridden - it listens on 127.0.0.1:9000 as nobody with five children, and
+# leaving it in place would mean two files fighting over one [www] section.
+#
+# Sizing is driven by the environment here exactly as it is in the Apache
+# config, but the syntax is unforgiving and undocumented: FPM expands ${VAR}
+# and rejects a bare $VAR outright with "is not a valid number (greater or
+# equal than zero)". Both forms were tested. Keep the braces on every one of
+# these or the container will not start.
+RUN printf '%s\n' \
+    '[global]' \
+    '; Container stderr. FPM otherwise defaults to a file under its install' \
+    '; prefix, which does not exist on a read-only root filesystem and aborts' \
+    '; startup with "failed to open error_log".' \
+    'error_log = /proc/self/fd/2' \
+    'daemonize = no' \
+    '; Restart the pool if 5 workers die of SIGSEGV/SIGBUS inside a minute,' \
+    '; rather than bleeding capacity silently until the pool is empty.' \
+    'emergency_restart_threshold = 5' \
+    'emergency_restart_interval = 1m' \
+    'process_control_timeout = 10s' \
+    '' \
+    '[www]' \
+    '; Ignored with a warning when the container already runs as UID 33, which' \
+    '; is the documented way to run this image. Kept because FPM refuses to' \
+    '; start without it when the container IS run as root.' \
+    'user = www-data' \
+    'group = www-data' \
+    '' \
+    '; A unix socket, not 127.0.0.1:9000: faster, unreachable from any other' \
+    '; container on the docker network, and it cannot exhaust ephemeral ports' \
+    '; under load. /run/php-fpm is tmpfs - see the compose file in the README.' \
+    'listen = /run/php-fpm/www.sock' \
+    'listen.owner = www-data' \
+    'listen.group = www-data' \
+    'listen.mode = 0660' \
+    '' \
+    '; How many requests may execute PHP at once. THIS is the memory budget the' \
+    '; mod_php image spent on MaxRequestWorkers: a forum or store page sits at' \
+    '; 60-90M resident, so ~24 is what a 2048M container affords. Apache can go' \
+    '; on accepting connections past this; they queue for a worker instead of' \
+    '; forking an interpreter nobody has the memory for.' \
+    'pm = ${PHP_FPM_PM}' \
+    'pm.max_children = ${PHP_FPM_MAX_CHILDREN}' \
+    '; Ignored unless pm is dynamic, and harmless when it is not (tested against' \
+    '; static and ondemand), so they are stated unconditionally rather than' \
+    '; templated in three variations.' \
+    'pm.start_servers = ${PHP_FPM_START_SERVERS}' \
+    'pm.min_spare_servers = ${PHP_FPM_MIN_SPARE_SERVERS}' \
+    'pm.max_spare_servers = ${PHP_FPM_MAX_SPARE_SERVERS}' \
+    '; Recycle a worker after this many requests so a slow leak in the app or an' \
+    '; extension cannot accumulate for the life of the container.' \
+    'pm.max_requests = ${PHP_FPM_MAX_REQUESTS}' \
+    '' \
+    '; The hard kill for a request that ignored max_execution_time - time spent' \
+    '; blocked in a database call or a socket read does not count against' \
+    '; max_execution_time, so without this a stuck worker is stuck forever.' \
+    'request_terminate_timeout = ${PHP_FPM_REQUEST_TERMINATE_TIMEOUT}' \
+    '' \
+    '; FPM will only execute paths ending in .php, whatever the web server asks' \
+    '; for. Third layer under the <If> guard and cgi.fix_pathinfo=0.' \
+    'security.limit_extensions = .php' \
+    '' \
+    '; PHP warnings and fatals reach the container log instead of being' \
+    '; swallowed. decorate_workers_output=no keeps a "NOTICE: PHP message:"' \
+    '; prefix off every one of them.' \
+    'catch_workers_output = yes' \
+    'decorate_workers_output = no' \
+    '; Apache already writes an access log; a second one per request is noise.' \
+    'access.log = /dev/null' \
+    '' \
+    '; Any request slower than this is logged with a full PHP backtrace showing' \
+    '; the function it was sitting in. There is no mod_php equivalent, and it is' \
+    '; the single best reason to run FPM when something is intermittently slow.' \
+    'slowlog = /proc/self/fd/2' \
+    'request_slowlog_timeout = ${PHP_FPM_SLOWLOG_TIMEOUT}' \
+    '' \
+    '; Answered by FPM itself, never by the application. See the Alias in 4d.' \
+    'ping.path = /fpm-ping' \
+    'ping.response = pong' \
+    '' \
+    '; Pass the container environment through to PHP. FPM clears it by default,' \
+    '; which would be a silent behaviour change from mod_php: getenv("DB_PASS")' \
+    '; and $_ENV would come back empty for every application configured that way.' \
+    'clear_env = no' \
+    > /etc/php${PHP_VER}/php-fpm.d/www.conf
+
+# 5. Entrypoint. Two processes in one container, which the mod_php image did
+# not need. It stays a plain shell script rather than supervisord (which drags
+# in Python) or s6 (which fights a non-root UID): it templates the pool, sizes
+# the MPM, and takes the container down if either process dies so Docker
+# restarts it rather than leaving it half alive.
+RUN printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    '' \
+    'RUN_DIR=/run/php-fpm' \
+    '' \
+    '# A whole number, or refuse to start. A typo here would otherwise become' \
+    '# either a silently clamped MPM or a division by zero below.' \
+    'num() {' \
+    '    case "$2" in' \
+    '        ""|*[!0-9]*) echo "entrypoint: $1 must be a whole number, got: $2" >&2; exit 1 ;;' \
+    '    esac' \
+    '    if [ "$2" -eq 0 ]; then' \
+    '        echo "entrypoint: $1 must be greater than zero" >&2; exit 1' \
+    '    fi' \
+    '}' \
+    '' \
+    '# Is this process running and not a zombie? `wait -n` would be the obvious' \
+    '# way to supervise two children, and it works in busybox ash everywhere' \
+    '# EXCEPT as PID 1, where it never returns when a child is killed - which is' \
+    '# precisely this container (verified: SIGKILL the FPM master and the shell' \
+    '# stays blocked forever while Apache serves 503s). Polling liveness is the' \
+    '# reliable alternative. The zombie check matters because PID 1 does not' \
+    '# always reap promptly, and kill -0 succeeds on a zombie.' \
+    'alive() {' \
+    '    kill -0 "$1" 2>/dev/null \' \
+    '        && ! grep -qE "^State:[[:space:]]+Z" "/proc/$1/status" 2>/dev/null' \
+    '}' \
+    '' \
+    'num APACHE_THREADS_PER_CHILD   "$APACHE_THREADS_PER_CHILD"' \
+    'num APACHE_MAX_REQUEST_WORKERS "$APACHE_MAX_REQUEST_WORKERS"' \
+    'num PHP_FPM_MAX_CHILDREN       "$PHP_FPM_MAX_CHILDREN"' \
+    '' \
+    '# event needs ServerLimit >= MaxRequestWorkers / ThreadsPerChild, and' \
+    '# MaxRequestWorkers to be a multiple of ThreadsPerChild; it clamps and warns' \
+    '# rather than failing when they disagree, so a raised worker count would' \
+    '# quietly not take effect. Derive both from the two numbers an operator' \
+    '# actually reasons about, rounding the workers UP to a whole child.' \
+    'threads=$APACHE_THREADS_PER_CHILD' \
+    'children=$(( ($APACHE_MAX_REQUEST_WORKERS + $threads - 1) / $threads ))' \
+    'APACHE_SERVER_LIMIT=$children' \
+    'APACHE_THREAD_LIMIT=$threads' \
+    'APACHE_MAX_REQUEST_WORKERS=$(( $children * $threads ))' \
+    'export APACHE_SERVER_LIMIT APACHE_THREAD_LIMIT APACHE_MAX_REQUEST_WORKERS' \
+    '' \
+    '# A socket left behind by an unclean stop makes FPM refuse to bind.' \
+    'mkdir -p "$RUN_DIR"' \
+    'rm -f "$RUN_DIR/www.sock"' \
+    '' \
+    'php-fpm --nodaemonize &' \
+    'FPM_PID=$!' \
+    '' \
+    '# Apache does not need the socket at parse time, but starting before it' \
+    '# exists means the first requests 503 and the healthcheck burns its start' \
+    '# period. Five seconds is generous: FPM either binds immediately or has' \
+    '# already logged why it cannot.' \
+    'i=0' \
+    'while [ ! -S "$RUN_DIR/www.sock" ]; do' \
+    '    i=$(( $i + 1 ))' \
+    '    if [ "$i" -gt 50 ]; then' \
+    '        echo "entrypoint: php-fpm never created $RUN_DIR/www.sock" >&2' \
+    '        kill "$FPM_PID" 2>/dev/null || true' \
+    '        exit 1' \
+    '    fi' \
+    '    kill -0 "$FPM_PID" 2>/dev/null \' \
+    '        || { echo "entrypoint: php-fpm exited during startup" >&2; exit 1; }' \
+    '    sleep 0.1' \
+    'done' \
+    '' \
+    'httpd -D FOREGROUND &' \
+    'HTTPD_PID=$!' \
+    '' \
+    '# WINCH is Apache graceful-stop and QUIT is FPM graceful-stop, so in-flight' \
+    '# requests finish rather than being severed the moment docker stop lands.' \
+    '# The wait is bounded at 9s to land just inside dockers default 10s grace' \
+    '# period, so a hung worker is still reported by us rather than SIGKILLed' \
+    '# out from under the log.' \
+    'shutdown() {' \
+    '    trap - TERM INT' \
+    '    kill -WINCH "$HTTPD_PID" 2>/dev/null || true' \
+    '    kill -QUIT  "$FPM_PID"   2>/dev/null || true' \
+    '    i=0' \
+    '    while alive "$HTTPD_PID" || alive "$FPM_PID"; do' \
+    '        i=$(( $i + 1 ))' \
+    '        if [ "$i" -gt 90 ]; then' \
+    '            echo "entrypoint: graceful stop timed out, forcing" >&2' \
+    '            kill -KILL "$HTTPD_PID" "$FPM_PID" 2>/dev/null || true' \
+    '            break' \
+    '        fi' \
+    '        sleep 0.1 || true' \
+    '    done' \
+    '    exit 0' \
+    '}' \
+    'trap shutdown TERM INT' \
+    '' \
+    '# Either process exiting takes the container down, so Docker restarts it.' \
+    '# Without this a dead FPM leaves Apache serving 503s indefinitely, and a' \
+    '# dead Apache leaves an idle FPM holding the container "up" and healthy-ish.' \
+    '# sleep is what makes the TERM trap above fire promptly - a signal is only' \
+    '# handled between commands, so the poll interval is also the shutdown' \
+    '# latency. || true keeps set -e from exiting when the signal interrupts it.' \
+    'while alive "$FPM_PID" && alive "$HTTPD_PID"; do' \
+    '    sleep 1 || true' \
+    'done' \
+    '' \
+    'if alive "$FPM_PID"; then' \
+    '    echo "entrypoint: httpd exited unexpectedly, stopping the container" >&2' \
+    'else' \
+    '    echo "entrypoint: php-fpm exited unexpectedly, stopping the container" >&2' \
+    'fi' \
+    'kill -TERM "$HTTPD_PID" "$FPM_PID" 2>/dev/null || true' \
+    'exit 1' \
+    > /usr/local/bin/docker-entrypoint.sh && \
+    chmod 0755 /usr/local/bin/docker-entrypoint.sh && \
+    sh -n /usr/local/bin/docker-entrypoint.sh
+
+# 6. Fix permissions on the runtime directories so a non-root user can write to
+# them. Both are tmpfs in the compose file; these are the fallbacks that make a
+# plain `docker run` without --tmpfs work as well.
+RUN mkdir -p /var/www/html /run/apache2 /run/php-fpm && \
+    chown -R www-data:www-data /var/www/html /run/apache2 /run/php-fpm /var/log/apache2
+
+# Defaults. TZ keeps date.timezone from being empty (PHP warns at startup if
+# it is); PHP_ALLOW_URL_FOPEN stays Off unless a compose file opts in.
+ENV TZ=UTC \
+    REMOTE_IP_HEADER=CF-Connecting-IP \
+    APACHE_SERVER_NAME=localhost \
+    APACHE_LIMIT_REQUEST_BODY=34603008 \
+    APACHE_START_SERVERS=2 \
+    APACHE_THREADS_PER_CHILD=64 \
+    APACHE_MAX_REQUEST_WORKERS=256 \
+    APACHE_MIN_SPARE_THREADS=32 \
+    APACHE_MAX_SPARE_THREADS=128 \
+    APACHE_SERVER_LIMIT=4 \
+    APACHE_THREAD_LIMIT=64 \
+    APACHE_MAX_CONNECTIONS_PER_CHILD=0 \
+    APACHE_PROXY_TIMEOUT=90 \
+    PHP_FPM_PM=dynamic \
+    PHP_FPM_MAX_CHILDREN=24 \
+    PHP_FPM_START_SERVERS=3 \
+    PHP_FPM_MIN_SPARE_SERVERS=3 \
+    PHP_FPM_MAX_SPARE_SERVERS=8 \
+    PHP_FPM_MAX_REQUESTS=500 \
+    PHP_FPM_REQUEST_TERMINATE_TIMEOUT=75 \
+    PHP_FPM_SLOWLOG_TIMEOUT=10s \
+    PHP_ALLOW_URL_FOPEN=0 \
+    PHP_DISPLAY_ERRORS=0 \
+    PHP_MEMORY_LIMIT=256M \
+    PHP_MAX_EXECUTION_TIME=60 \
+    PHP_POST_MAX_SIZE=32M \
+    PHP_UPLOAD_MAX_FILESIZE=24M \
+    PHP_MAX_FILE_UPLOADS=20 \
+    PHP_OPEN_BASEDIR=/var/www:/tmp \
+    PHP_DISABLE_FUNCTIONS=exec,passthru,shell_exec,system,proc_open,proc_close,proc_get_status,proc_nice,proc_terminate,popen,pcntl_exec,pcntl_fork,dl,show_source,highlight_file \
+    PHP_OPCACHE_ENABLE=1 \
+    PHP_OPCACHE_MEMORY=128 \
+    PHP_OPCACHE_VALIDATE_TIMESTAMPS=1 \
+    PHP_OPCACHE_REVALIDATE_FREQ=2
+
+WORKDIR /var/www/html
+
+# Port 80, so Traefik can route to it without a per-service port override.
+# Running as a non-root user still binds it because the compose files set
+# net.ipv4.ip_unprivileged_port_start=0.
+EXPOSE 80
+
+# /fpm-ping rather than /, so the probe does not execute the application and
+# its database queries 2,880 times a day. It still covers both processes: the
+# request is served by Apache and answered by FPM over the socket.
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD curl -fsS -A docker-healthcheck http://127.0.0.1/fpm-ping -o /dev/null || exit 1
+
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
