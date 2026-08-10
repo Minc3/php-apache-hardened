@@ -109,6 +109,21 @@ exactly the behaviour described under [Hardening](#hardening).
 |---|---|---|
 | `APACHE_SERVER_NAME` | `localhost` | `ServerName`. Used only for self-referential URLs; `UseCanonicalName` is `Off`, so `SERVER_NAME` still comes from the `Host` header. |
 | `APACHE_LIMIT_REQUEST_BODY` | `34603008` | Max request body in bytes (33 MB). Keep above `PHP_POST_MAX_SIZE`, or large uploads are rejected with a 413 before PHP sees them. |
+| `APACHE_START_SERVERS` | `3` | Children forked at startup. |
+| `APACHE_MIN_SPARE_SERVERS` | `3` | Idle children kept in reserve; below this Apache forks more. |
+| `APACHE_MAX_SPARE_SERVERS` | `8` | Idle ceiling; above this Apache reaps. Keep it at or above `APACHE_MIN_SPARE_SERVERS` — prefork silently raises it to `MinSpareServers + 1` otherwise, with no warning. |
+| `APACHE_MAX_REQUEST_WORKERS` | `24` | Hard concurrency cap. `ServerLimit` tracks this variable, so values above 256 actually take effect — stock Apache would clamp there. See the note below. |
+| `APACHE_MAX_CONNECTIONS_PER_CHILD` | `500` | Requests a child serves before it is recycled, so a slow leak in the application or an extension cannot accumulate for the life of the container. `0` disables recycling. |
+
+> **`APACHE_MAX_REQUEST_WORKERS` is a memory budget, not a throughput dial.**
+> `mpm_prefork` with mod_php gives every child its own interpreter, and a child
+> serving a forum or store page sits at roughly 60–90 MB resident — so 24 is
+> about what a 2048 MB container affords. Raise it only alongside the container
+> memory limit, or you trade queueing for an OOM kill. Requests over the cap
+> wait in the listen backlog, which degrades far more gracefully than either
+> running out of memory or running the process table out. Watch the container
+> `pids` limit too: every worker is a process, so the cap must clear
+> `MaxRequestWorkers` plus the parent and the healthcheck `curl`.
 
 ### PHP limits
 
@@ -182,6 +197,16 @@ services:
     tmpfs:
       - /run/apache2:uid=33,gid=33,mode=0755,noexec,nosuid,nodev
       - /tmp:uid=33,gid=33,mode=1777,noexec,nosuid,nodev
+
+    # APACHE_MAX_REQUEST_WORKERS defaults to 24, sized against this memory
+    # limit. Change one and change the other; pids is only a backstop now,
+    # not the binding constraint.
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: '2048M'
+          pids: 256
 
     # Apache logs to stdout, so every access line becomes a host json-file
     # entry. Uncapped that grows until the disk is full. 30M holds enough

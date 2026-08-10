@@ -244,17 +244,27 @@ RUN printf '%s\n' \
 # a forum or store page sits around 60-90M resident, so ~2G is the wall. Excess
 # connections wait in the listen backlog, which degrades far better than either
 # failure mode above. Raise this only alongside the compose memory limit.
+# All five are env vars (defaults below) so a deployment with a different
+# memory limit can resize without a rebuild - but they are one budget: keep
+# MaxRequestWorkers x per-child RSS under the container memory limit, and
+# MaxSpareServers at or above MinSpareServers, or prefork silently raises it
+# to MinSpareServers + 1 - no warning, so a bad pair just does not take effect.
 # Named zz- so it sorts after mpm.conf in conf.d and therefore wins; custom.conf
 # would not, it sorts before it.
 RUN printf '%s\n' \
     '<IfModule mpm_prefork_module>' \
-    '    StartServers             3' \
-    '    MinSpareServers          3' \
-    '    MaxSpareServers          8' \
-    '    MaxRequestWorkers       24' \
+    '    StartServers            ${APACHE_START_SERVERS}' \
+    '    MinSpareServers         ${APACHE_MIN_SPARE_SERVERS}' \
+    '    MaxSpareServers         ${APACHE_MAX_SPARE_SERVERS}' \
+    '    # ServerLimit is the hard ceiling on MaxRequestWorkers - prefork' \
+    '    # defaults it to 256 and silently clamps anything above - so it' \
+    '    # tracks the same variable, otherwise raising the env var past 256' \
+    '    # would log a warning and have no effect.' \
+    '    ServerLimit             ${APACHE_MAX_REQUEST_WORKERS}' \
+    '    MaxRequestWorkers       ${APACHE_MAX_REQUEST_WORKERS}' \
     '    # Recycle children periodically so a slow leak in the app or an' \
     '    # extension cannot accumulate for the life of the container.' \
-    '    MaxConnectionsPerChild 500' \
+    '    MaxConnectionsPerChild  ${APACHE_MAX_CONNECTIONS_PER_CHILD}' \
     '</IfModule>' \
     > /etc/apache2/conf.d/zz-mpm.conf
 
@@ -343,6 +353,11 @@ ENV TZ=UTC \
     REMOTE_IP_HEADER=CF-Connecting-IP \
     APACHE_SERVER_NAME=localhost \
     APACHE_LIMIT_REQUEST_BODY=34603008 \
+    APACHE_START_SERVERS=3 \
+    APACHE_MIN_SPARE_SERVERS=3 \
+    APACHE_MAX_SPARE_SERVERS=8 \
+    APACHE_MAX_REQUEST_WORKERS=24 \
+    APACHE_MAX_CONNECTIONS_PER_CHILD=500 \
     PHP_ALLOW_URL_FOPEN=0 \
     PHP_DISPLAY_ERRORS=0 \
     PHP_MEMORY_LIMIT=256M \
