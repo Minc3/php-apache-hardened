@@ -616,8 +616,29 @@ RUN printf '%s\n' \
     'APACHE_MAX_REQUEST_WORKERS=$(( $children * $threads ))' \
     'export APACHE_SERVER_LIMIT APACHE_THREAD_LIMIT APACHE_MAX_REQUEST_WORKERS' \
     '' \
+    '# The socket directory has to be writable, and under read_only: true that' \
+    '# means a tmpfs. The directory exists in the image, so without one FPM' \
+    '# gets as far as bind() and fails with "Read-only file system (30)" - an' \
+    '# error that names the symptom and not the fix, which is one line of' \
+    '# compose. This is the single most likely way to misconfigure the FPM' \
+    '# variant, because it is the one thing that differs from the mod_php' \
+    '# image, so say exactly what to add rather than letting FPM report it.' \
+    '# touch, not `: > file`. A redirection failure on a POSIX *special*' \
+    '# builtin - and `:` is one - kills the shell outright, even inside an' \
+    '# `if !` condition, so the probe would exit 1 silently and never print a' \
+    '# word of the advice below. touch is a regular command and simply' \
+    '# returns non-zero (verified against busybox ash).' \
+    'if ! { mkdir -p "$RUN_DIR" && touch "$RUN_DIR/.writable"; } 2>/dev/null; then' \
+    '    echo "entrypoint: ${RUN_DIR} is not writable, so php-fpm cannot create its socket." >&2' \
+    '    echo "entrypoint: this image needs it on a tmpfs. Add to the container:" >&2' \
+    '    echo "entrypoint:     tmpfs:" >&2' \
+    '    echo "entrypoint:       - ${RUN_DIR}:uid=33,gid=33,mode=0755,noexec,nosuid,nodev" >&2' \
+    '    echo "entrypoint: (docker run: --tmpfs ${RUN_DIR}:uid=33,gid=33,mode=0755)" >&2' \
+    '    exit 1' \
+    'fi' \
+    'rm -f "$RUN_DIR/.writable"' \
+    '' \
     '# A socket left behind by an unclean stop makes FPM refuse to bind.' \
-    'mkdir -p "$RUN_DIR"' \
     'rm -f "$RUN_DIR/www.sock"' \
     '' \
     'php-fpm --nodaemonize &' \

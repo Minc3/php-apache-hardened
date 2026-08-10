@@ -407,6 +407,33 @@ assert_custom() { # <name> <body> <variant>
     fi
 }
 
+# Dropping the /run/php-fpm tmpfs is the one way the FPM variant gets
+# misconfigured in practice, because it is the only thing that differs from a
+# working mod_php compose file. FPM's own error ("Read-only file system (30)")
+# names the symptom and not the fix, so the entrypoint checks first and prints
+# the line to add. Assert the advice, not just the failure - an unhelpful
+# message here costs somebody an afternoon.
+assert_missing_tmpfs() { # <image> <major>
+    local image="$1" major="$2" name="notmpfs-${2}-${STAMP}" out rc
+    docker rm -f "$name" >/dev/null 2>&1 || true
+    CONTAINERS="${CONTAINERS} ${name}"
+    # Deliberately without --tmpfs /run/php-fpm, everything else as documented.
+    out="$(docker run --name "$name" --user 33:33 --read-only \
+        --sysctl net.ipv4.ip_unprivileged_port_start=0 \
+        --tmpfs "/run/apache2:uid=33,gid=33,mode=0755,noexec,nosuid,nodev" \
+        --tmpfs "/tmp:uid=33,gid=33,mode=1777,noexec,nosuid,nodev" \
+        "$image" 2>&1)" && rc=0 || rc=$?
+    chk "missing tmpfs fails fast" "$([[ "${rc:-0}" != 0 ]] && echo nonzero || echo zero)" "nonzero"
+    chk_has "names the directory"  "$out" "/run/php-fpm is not writable"
+    chk_has "prints the fix"       "$out" "uid=33,gid=33,mode=0755"
+    # It must not degrade into FPM's own unhelpful error instead.
+    case "$out" in
+        *"Read-only file system (30)"*) bad "advice replaces FPM's error" "FPM error shown" "entrypoint advice" ;;
+        *) ok ;;
+    esac
+    docker rm -f "$name" >/dev/null 2>&1 || true
+}
+
 assert_fpm_dynamic() { # <image> <variant> <major>
     local image="$1" variant="$2" major="$3" name resolved
     name="dyn-${major}-${STAMP}"
@@ -566,6 +593,10 @@ for variant in $VARIANTS; do
             CTX="${variant}/${major}/pm-dynamic"
             head2 "pm=dynamic pool sizing"
             assert_fpm_dynamic "$IMAGE_UNDER_TEST" "$variant" "$major"
+
+            CTX="${variant}/${major}/missing-tmpfs"
+            head2 "missing /run/php-fpm tmpfs is diagnosed"
+            assert_missing_tmpfs "$IMAGE_UNDER_TEST" "$major"
 
             # ---- pass 4: process supervision ----
             CTX="${variant}/${major}/supervisor"

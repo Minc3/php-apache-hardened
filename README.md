@@ -618,7 +618,7 @@ all resolve to a real file via `mod_rewrite` before the handler is chosen.
 | A settings change has no effect | The container was not recreated. `docker compose up -d --force-recreate`. |
 | `TZ` appears ignored | Check the variable reached the container: `docker exec <c> printenv TZ`. |
 | **`-fpm`:** every page 500s, log says `Invalid command 'php_value'` | An `.htaccess` uses mod_php directives. See [above](#php_value-in-htaccess). |
-| **`-fpm`:** container exits at startup, `php-fpm never created /run/php-fpm/www.sock` | The `/run/php-fpm` tmpfs is missing from the compose file. |
+| **`-fpm`:** container exits at startup, `entrypoint: /run/php-fpm is not writable` | The `/run/php-fpm` tmpfs is missing from the compose file. The message prints the exact line to add. |
 | **`-fpm`:** `/index.php/foo` returns 404 | PATH_INFO routing, [not supported](#path_info-routing). |
 | **`-fpm`:** raising `APACHE_MAX_REQUEST_WORKERS` changes nothing | It rounds up to a multiple of `APACHE_THREADS_PER_CHILD`; raise that instead for large jumps. |
 | **`-fpm`:** requests queue while CPU and memory are idle | `PHP_FPM_MAX_CHILDREN`, not the Apache worker count, is the PHP concurrency limit. |
@@ -732,6 +732,10 @@ smoke test covers "it serves PHP", not "every setting still behaves".
 
 ## Notes
 
+- `README.dockerhub.md` is the short version used as the Docker Hub
+  description — this file is well over Docker Hub's 25,000 character limit.
+  Defaults quoted there are duplicated from the Dockerfiles, so change both
+  together when a default moves.
 - mod_php tags run `mpm_prefork`; `-fpm` tags run `mpm_event` with PHP-FPM over
   a unix socket at `/run/php-fpm/www.sock`.
 - All PHP majors are built from one Dockerfile per variant via a `PHP_VER`
