@@ -216,9 +216,11 @@ if ($missing) { http_response_code(500); echo 'MISSING: ', implode(',', $missing
 if (!extension_loaded('Zend OPcache')) { http_response_code(500); echo 'MISSING: opcache'; exit; }
 echo 'SMOKE-OK ', PHP_VERSION, ' ', php_sapi_name();
 PHP
-    # A file that must never be served, and a .php that does not exist, so the
-    # deny rules and the FastCGI guard are covered rather than assumed.
+    # A file that must never be served, and a static one used to prove a .php
+    # path suffix cannot execute - so the deny rules and the handler guard are
+    # covered rather than assumed.
     printf 'must-not-be-served\n' > "$root/html/.env"
+    printf 'plain\n'              > "$root/html/static.txt"
     chmod -R a+rX "$root"
 
     local tmpfs_args=(--tmpfs "/run/apache2:uid=33,gid=33,mode=0755"
@@ -271,9 +273,26 @@ PHP
                     http://127.0.0.1/.env 2>/dev/null || echo 000)"
         [[ "$code" == 403 ]] || { log "  php${major}: /.env returned ${code}, expected 403"; rc=1; }
 
+        # A non-PHP file with a .php path suffix must never reach the
+        # interpreter. This is the shape the attack actually takes
+        # (/uploads/avatar.jpg/shell.php) and it holds on both variants:
+        # Apache resolves the filename to static.txt, which does not match the
+        # PHP handler, so the trailing path is refused.
         code="$(docker exec "$name" curl -s -o /dev/null -w '%{http_code}' \
-                    http://127.0.0.1/index.php/nonexistent.php 2>/dev/null || echo 000)"
-        [[ "$code" == 404 ]] || { log "  php${major}: orphan path-info returned ${code}, expected 404"; rc=1; }
+                    http://127.0.0.1/static.txt/x.php 2>/dev/null || echo 000)"
+        [[ "$code" == 404 ]] || { log "  php${major}: .php suffix on a static file returned ${code}, expected 404"; rc=1; }
+
+        # /index.php/anything is a different question and the two variants
+        # answer it differently BY DESIGN, so it is only asserted where it
+        # applies. mod_php runs the real index.php with PATH_INFO set, which is
+        # correct and is how PATH_INFO routing has always worked; the FPM image
+        # refuses it, because <If "-f"> only hands over paths that are real
+        # files. Asserting 404 for both wrongly failed every mod_php build.
+        if [[ "$variant" == fpm ]]; then
+            code="$(docker exec "$name" curl -s -o /dev/null -w '%{http_code}' \
+                        http://127.0.0.1/index.php/nonexistent.php 2>/dev/null || echo 000)"
+            [[ "$code" == 404 ]] || { log "  php${major}: orphan path-info returned ${code}, expected 404"; rc=1; }
+        fi
 
         # Both processes have to be up for this to answer, so it doubles as the
         # check that the FPM socket is actually wired to Apache.

@@ -347,14 +347,20 @@ services:
 
     # PHP_FPM_MAX_CHILDREN (24) is the memory budget now, not the Apache
     # worker count - the 256 default connections are cheap by comparison.
-    # pids is far less pressured here: 2 Apache children plus the FPM master
-    # and its workers, rather than one process per connection.
+    #
+    # pids must be HIGHER here than on the mod_php image, not lower. The
+    # limit counts tasks, and a thread is a task: mpm_event runs
+    # ThreadsPerChild (64) of them per child, so the four children the
+    # defaults allow are ~260 tasks on their own. Measured: 140 at idle and
+    # 293 at the ceiling, against 27 for the whole mod_php image. Set it
+    # below that and Apache dies at startup with AH03104
+    # "unable to create worker thread".
     deploy:
       resources:
         limits:
           cpus: '2'
           memory: '2048M'
-          pids: 128
+          pids: 512
 
     logging:
       driver: json-file
@@ -619,6 +625,7 @@ all resolve to a real file via `mod_rewrite` before the handler is chosen.
 | `TZ` appears ignored | Check the variable reached the container: `docker exec <c> printenv TZ`. |
 | **`-fpm`:** every page 500s, log says `Invalid command 'php_value'` | An `.htaccess` uses mod_php directives. See [above](#php_value-in-htaccess). |
 | **`-fpm`:** container exits at startup, `entrypoint: /run/php-fpm is not writable` | The `/run/php-fpm` tmpfs is missing from the compose file. The message prints the exact line to add. |
+| **`-fpm`:** `AH03104: ap_thread_create: unable to create worker thread`, then `AH02324 … httpd is exiting!` | The container `pids` limit is too low. It counts **threads**, and `mpm_event` runs `APACHE_THREADS_PER_CHILD` per child — 140 tasks at idle on the defaults. Raise `pids` to `512`, or lower `APACHE_THREADS_PER_CHILD` / `APACHE_MAX_REQUEST_WORKERS`. |
 | **`-fpm`:** `/index.php/foo` returns 404 | PATH_INFO routing, [not supported](#path_info-routing). |
 | **`-fpm`:** raising `APACHE_MAX_REQUEST_WORKERS` changes nothing | It rounds up to a multiple of `APACHE_THREADS_PER_CHILD`; raise that instead for large jumps. |
 | **`-fpm`:** requests queue while CPU and memory are idle | `PHP_FPM_MAX_CHILDREN`, not the Apache worker count, is the PHP concurrency limit. |

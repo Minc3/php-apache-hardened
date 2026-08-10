@@ -228,6 +228,10 @@ assert_serving() { # <name> <body> <variant>
     chk "static served"   "$(code "$name" /static.txt)"   "200"
     chk "DirectoryIndex"  "$(code "$name" /sub/)"         "200"
     chk "missing .php"    "$(code "$name" /nope.php)"     "404"
+    # The real attack shape - /uploads/avatar.jpg/shell.php - must not execute
+    # on either variant. Note this is NOT the same question as
+    # /index.php/anything, which mod_php legitimately serves with PATH_INFO.
+    chk ".php suffix on static file" "$(code "$name" /static.txt/x.php)" "404"
     chk "no apache warns" "$(try_all docker logs "$name" | grep -ci 'AH0[0-9]*: WARNING')" "0"
 
     # Response headers are fixed policy and must survive any configuration.

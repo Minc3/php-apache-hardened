@@ -139,7 +139,11 @@ services:
 
     deploy:
       resources:
-        limits: { cpus: '2', memory: '2048M', pids: 128 }
+        # pids must be HIGHER than the mod_php image, not lower: the limit
+        # counts tasks, and mpm_event runs 64 threads per child. Measured
+        # 140 at idle, 293 at the ceiling. Too low and Apache dies at
+        # startup with AH03104 "unable to create worker thread".
+        limits: { cpus: '2', memory: '2048M', pids: 512 }
 
     logging:
       driver: json-file
@@ -243,6 +247,7 @@ Excluded on purpose: `phar`, `posix`, `pcntl`, `ftp`, `sockets`, `soap`.
 | A settings change does nothing | Recreate the container: `docker compose up -d --force-recreate`. |
 | **`-fpm`:** every page 500s, `Invalid command 'php_value'` | An `.htaccess` uses mod_php directives — see below. |
 | **`-fpm`:** exits with `entrypoint: /run/php-fpm is not writable` | The `/run/php-fpm` tmpfs is missing — the error prints the exact line to add. |
+| **`-fpm`:** `AH03104: unable to create worker thread` | `pids` limit too low. It counts **threads**, and `mpm_event` runs 64 per child (140 tasks at idle). Use `pids: 512`. |
 | **`-fpm`:** `/index.php/foo` returns 404 | PATH_INFO routing is not supported; rewrites are. |
 
 ### Migrating to `-fpm`: check your `.htaccess` first
